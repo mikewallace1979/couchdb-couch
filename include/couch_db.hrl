@@ -44,7 +44,9 @@
     rev,
     seq = 0,
     deleted = false,
-    body_sp = nil % stream pointer
+    body_sp = nil, % stream pointer
+    px_epoch = 0,
+    px_seq = 0
 }).
 
 -record(doc_info, {
@@ -63,7 +65,9 @@
     update_seq = 0,
     deleted = false,
     rev_tree = [],
-    sizes = #size_info{}
+    sizes = #size_info{},
+    px_epoch = 0,
+    px_seq = 0
 }).
 
 -record(httpd, {
@@ -95,7 +99,11 @@
 
     % key/value tuple of meta information, provided when using special options:
     % couch_db:open_doc(Db, Id, Options).
-    meta = []
+    meta = [],
+
+    % paxos things
+    px_epoch = 0,
+    px_seq = 0
 }).
 
 
@@ -205,6 +213,8 @@
     ptr,
     seq,
     sizes = #size_info{},
-    atts = []
+    atts = [],
+    px_epoch = 0,
+    px_seq = 0
 }).
 

@@ -23,6 +23,7 @@
 -export([with_ejson_body/1]).
 -export([is_deleted/1]).
 -export([num_mp_writers/1]).
+-export([get_winning_rev_info/1]).
 
 -include_lib("couch/include/couch_db.hrl").
 
@@ -108,8 +109,10 @@ to_json_obj(Doc, Options) ->
     doc_to_json_obj(with_ejson_body(Doc), Options).
 
 doc_to_json_obj(#doc{id=Id,deleted=Del,body=Body,revs={Start, RevIds},
-            meta=Meta}=Doc,Options)->
+            meta=Meta, px_epoch=PxEpoch, px_seq=PxSeq}=Doc,Options)->
     {[{<<"_id">>, Id}]
+        ++ [{<<"_px_epoch">>, PxEpoch}]
+        ++ [{<<"_px_seq">>, PxSeq}]
         ++ to_json_rev(Start, RevIds)
         ++ to_json_body(Del, Body)
         ++ to_json_revisions(Options, Start, RevIds)
@@ -236,6 +239,12 @@ transfer_fields([{<<"_replication_stats">>, _} = Field | Rest],
     #doc{body=Fields} = Doc) ->
     transfer_fields(Rest, Doc#doc{body=[Field|Fields]});
 
+% special fields for paxos
+transfer_fields([{<<"_px_epoch">>, PxEpoch} | Rest], Doc) ->
+    transfer_fields(Rest, Doc#doc{px_epoch=PxEpoch});
+transfer_fields([{<<"_px_seq">>, PxSeq} | Rest], Doc) ->
+    transfer_fields(Rest, Doc#doc{px_seq=PxSeq});
+
 % unknown special field
 transfer_fields([{<<"_",Name/binary>>, _} | _], _) ->
     throw({doc_validation,
@@ -264,6 +273,28 @@ max_seq(Tree, UpdateSeq) ->
         end
     end,
     couch_key_tree:fold(FoldFun, UpdateSeq, Tree).
+
+% TODO remove obvious duplication
+get_winning_rev_info(Tree) ->
+    RevInfosAndPath = [
+        {#rev_info{
+            deleted = Leaf#leaf.deleted,
+            body_sp = Leaf#leaf.ptr,
+            seq = Leaf#leaf.seq,
+            rev = {Pos, RevId},
+            px_epoch = Leaf#leaf.px_epoch,
+            px_seq = Leaf#leaf.px_seq
+        }, Path} || {Leaf, {Pos, [RevId | _]} = Path} <-
+            couch_key_tree:get_all_leafs(Tree)
+    ],
+    SortedRevInfosAndPath = lists:sort(
+            fun({#rev_info{deleted=DeletedA,rev=RevA}, _PathA},
+                {#rev_info{deleted=DeletedB,rev=RevB}, _PathB}) ->
+            % sort descending by {not deleted, rev}
+            {not DeletedA, RevA} > {not DeletedB, RevB}
+        end, RevInfosAndPath),
+    [{RevInfo, _WinPath}|_] = SortedRevInfosAndPath,
+    RevInfo.
 
 to_doc_info_path(#full_doc_info{id=Id,rev_tree=Tree,update_seq=FDISeq}) ->
     RevInfosAndPath = [

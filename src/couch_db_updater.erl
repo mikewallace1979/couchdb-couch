@@ -394,13 +394,15 @@ rev_tree(DiskTree) ->
                 seq = Seq,
                 sizes = upgrade_sizes(Size)
             };
-        (_RevId, {Del, Ptr, Seq, Sizes, Atts}) ->
+        (_RevId, {Del, Ptr, Seq, Sizes, Atts, PxEpoch, PxSeq}) ->
             #leaf{
                 deleted = ?i2b(Del),
                 ptr = Ptr,
                 seq = Seq,
                 sizes = upgrade_sizes(Sizes),
-                atts = Atts
+                atts = Atts,
+                px_epoch = PxEpoch,
+                px_seq = PxSeq
             };
         (_RevId, ?REV_MISSING) ->
             ?REV_MISSING
@@ -416,9 +418,11 @@ disk_tree(RevTree) ->
                 ptr = Ptr,
                 seq = Seq,
                 sizes = Sizes,
-                atts = Atts
+                atts = Atts,
+                px_epoch = PxEpoch,
+                px_seq = PxSeq
             } = Leaf,
-            {?b2i(Del), Ptr, Seq, split_sizes(Sizes), Atts}
+            {?b2i(Del), Ptr, Seq, split_sizes(Sizes), Atts, PxEpoch, PxSeq}
     end, RevTree).
 
 upgrade_sizes(#size_info{}=SI) ->
@@ -440,19 +444,23 @@ btree_by_seq_split(#full_doc_info{}=Info) ->
         update_seq = Seq,
         deleted = Del,
         sizes = SizeInfo,
-        rev_tree = Tree
+        rev_tree = Tree,
+        px_epoch = PxEpoch,
+        px_seq = PxSeq
     } = Info,
-    {Seq, {Id, ?b2i(Del), split_sizes(SizeInfo), disk_tree(Tree)}}.
+    {Seq, {Id, ?b2i(Del), split_sizes(SizeInfo), disk_tree(Tree), PxEpoch, PxSeq}}.
 
-btree_by_seq_join(Seq, {Id, Del, DiskTree}) when is_integer(Del) ->
-    btree_by_seq_join(Seq, {Id, Del, {0, 0}, DiskTree});
-btree_by_seq_join(Seq, {Id, Del, Sizes, DiskTree}) when is_integer(Del) ->
+btree_by_seq_join(Seq, {Id, Del, DiskTree, PxEpoch, PxSeq}) when is_integer(Del) ->
+    btree_by_seq_join(Seq, {Id, Del, {0, 0}, DiskTree, PxEpoch, PxSeq});
+btree_by_seq_join(Seq, {Id, Del, Sizes, DiskTree, PxEpoch, PxSeq}) when is_integer(Del) ->
     #full_doc_info{
         id = Id,
         update_seq = Seq,
         deleted = ?i2b(Del),
         sizes = join_sizes(Sizes),
-        rev_tree = rev_tree(DiskTree)
+        rev_tree = rev_tree(DiskTree),
+        px_epoch = PxEpoch,
+        px_seq = PxSeq
     };
 btree_by_seq_join(KeySeq, {Id, RevInfos, DeletedRevInfos}) ->
     % Older versions stored #doc_info records in the seq_tree.
@@ -472,21 +480,25 @@ btree_by_id_split(#full_doc_info{}=Info) ->
         update_seq = Seq,
         deleted = Deleted,
         sizes = SizeInfo,
-        rev_tree = Tree
+        rev_tree = Tree,
+        px_epoch = PxEpoch,
+        px_seq = PxSeq
     } = Info,
-    {Id, {Seq, ?b2i(Deleted), split_sizes(SizeInfo), disk_tree(Tree)}}.
+    {Id, {Seq, ?b2i(Deleted), split_sizes(SizeInfo), disk_tree(Tree), PxEpoch, PxSeq}}.
 
 % Handle old formats before data_size was added
-btree_by_id_join(Id, {HighSeq, Deleted, DiskTree}) ->
-    btree_by_id_join(Id, {HighSeq, Deleted, #size_info{}, DiskTree});
+btree_by_id_join(Id, {HighSeq, Deleted, DiskTree, PxEpoch, PxSeq}) ->
+    btree_by_id_join(Id, {HighSeq, Deleted, #size_info{}, DiskTree, PxEpoch, PxSeq});
 
-btree_by_id_join(Id, {HighSeq, Deleted, Sizes, DiskTree}) ->
+btree_by_id_join(Id, {HighSeq, Deleted, Sizes, DiskTree, PxEpoch, PxSeq}) ->
     #full_doc_info{
         id = Id,
         update_seq = HighSeq,
         deleted = ?i2b(Deleted),
         sizes = upgrade_sizes(Sizes),
-        rev_tree = rev_tree(DiskTree)
+        rev_tree = rev_tree(DiskTree),
+        px_epoch = PxEpoch,
+        px_seq = PxSeq
     }.
 
 btree_by_id_reduce(reduce, FullDocInfos) ->
@@ -637,7 +649,7 @@ flush_trees(#db{fd = Fd} = Db,
     {Flushed, FinalAcc} = couch_key_tree:mapfold(
         fun(_Rev, Value, Type, SizesAcc) ->
             case Value of
-            #doc{deleted = IsDeleted, body = {summary, _, _, _} = DocSummary} ->
+            #doc{deleted = IsDeleted, body = {summary, _, _, _} = DocSummary, px_epoch=PxEpoch, px_seq=PxSeq} ->
                 {summary, Summary, AttSizeInfo, AttsFd} = DocSummary,
                 % this node value is actually an unwritten document summary,
                 % write to disk.
@@ -668,7 +680,9 @@ flush_trees(#db{fd = Fd} = Db,
                         active = SummarySize,
                         external = ExternalSize
                     },
-                    atts = AttSizeInfo
+                    atts = AttSizeInfo,
+                    px_epoch = PxEpoch,
+                    px_seq = PxSeq
                 },
                 {Leaf, add_sizes(Type, Leaf, SizesAcc)};
             #leaf{} ->
@@ -679,12 +693,15 @@ flush_trees(#db{fd = Fd} = Db,
         end, {0, 0, []}, Unflushed),
     {FinalAS, FinalES, FinalAtts} = FinalAcc,
     TotalAttSize = lists:foldl(fun({_, S}, A) -> S + A end, 0, FinalAtts),
+    WinningRev = couch_doc:get_winning_rev_info(Flushed),
     NewInfo = InfoUnflushed#full_doc_info{
         rev_tree = Flushed,
         sizes = #size_info{
             active = FinalAS + TotalAttSize,
             external = FinalES + TotalAttSize
-        }
+        },
+        px_epoch = WinningRev#rev_info.px_epoch,
+        px_seq = WinningRev#rev_info.px_seq
     },
     flush_trees(Db, RestUnflushed, [NewInfo | AccFlushed]).
 
@@ -843,10 +860,10 @@ update_docs_int(Db, DocsList, NonRepDocs, MergeConflicts, FullCommit) ->
     OldDocInfos = lists:zipwith(
         fun(_Id, {ok, FullDocInfo}) ->
             FullDocInfo;
-        (Id, not_found) ->
-            #full_doc_info{id=Id}
+        ([{_Client, #doc{id=Id,px_epoch=PxEpoch,px_seq=PxSeq}}|_], not_found) ->
+            #full_doc_info{id=Id,px_epoch=PxEpoch,px_seq=PxSeq} % This works but is it right?
         end,
-        Ids, OldDocLookups),
+        DocsList, OldDocLookups),
     % Merge the new docs into the revision trees.
     {ok, NewFullDocInfos, RemoveSeqs, NewSeq} = merge_rev_trees(RevsLimit,
             MergeConflicts, DocsList, OldDocInfos, [], [], LastSeq),

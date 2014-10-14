@@ -29,7 +29,7 @@
 -export([set_security/2,get_security/1]).
 -export([changes_since/4,changes_since/5,read_doc/2,new_revid/1]).
 -export([check_is_admin/1, check_is_member/1, get_doc_count/1]).
--export([reopen/1, is_system_db/1, compression/1, make_doc/5]).
+-export([reopen/1, is_system_db/1, compression/1, make_doc/7]).
 -export([load_validation_funs/1]).
 -export([check_md5/2, with_stream/3]).
 
@@ -626,7 +626,7 @@ load_validation_funs(#db{main_pid=Pid}=Db) ->
     gen_server:cast(Pid, {load_validation_funs, Funs}),
     Funs.
 
-prep_and_validate_update(Db, #doc{id=Id,revs={RevStart, Revs}}=Doc,
+prep_and_validate_update(Db, #doc{id=Id,revs={RevStart, Revs},px_epoch=PxEpoch,px_seq=PxSeq}=Doc,
         OldFullDocInfo, LeafRevsDict, AllowConflict) ->
     case Revs of
     [PrevRev|_] ->
@@ -634,11 +634,11 @@ prep_and_validate_update(Db, #doc{id=Id,revs={RevStart, Revs}}=Doc,
         {ok, {#leaf{deleted=Deleted, ptr=DiskSp}, DiskRevs}} ->
             case couch_doc:has_stubs(Doc) of
             true ->
-                DiskDoc = make_doc(Db, Id, Deleted, DiskSp, DiskRevs),
+                DiskDoc = make_doc(Db, Id, Deleted, DiskSp, DiskRevs, PxEpoch, PxSeq),
                 Doc2 = couch_doc:merge_stubs(Doc, DiskDoc),
                 {validate_doc_update(Db, Doc2, fun() -> DiskDoc end), Doc2};
             false ->
-                LoadDiskDoc = fun() -> make_doc(Db,Id,Deleted,DiskSp,DiskRevs) end,
+                LoadDiskDoc = fun() -> make_doc(Db,Id,Deleted,DiskSp,DiskRevs, PxEpoch, PxSeq) end,
                 {validate_doc_update(Db, Doc, LoadDiskDoc), Doc}
             end;
         error when AllowConflict ->
@@ -952,9 +952,9 @@ make_first_doc_on_disk(Db, Id, Pos, [{_Rev, #doc{}} | RestPath]) ->
     make_first_doc_on_disk(Db, Id, Pos-1, RestPath);
 make_first_doc_on_disk(Db, Id, Pos, [{_Rev, ?REV_MISSING}|RestPath]) ->
     make_first_doc_on_disk(Db, Id, Pos - 1, RestPath);
-make_first_doc_on_disk(Db, Id, Pos, [{_Rev, #leaf{deleted=IsDel, ptr=Sp}} |_]=DocPath) ->
+make_first_doc_on_disk(Db, Id, Pos, [{_Rev, #leaf{deleted=IsDel, ptr=Sp, px_epoch=PxEpoch, px_seq=PxSeq}} |_]=DocPath) ->
     Revs = [Rev || {Rev, _} <- DocPath],
-    make_doc(Db, Id, IsDel, Sp, {Pos, Revs}).
+    make_doc(Db, Id, IsDel, Sp, {Pos, Revs}, PxEpoch, PxSeq).
 
 set_commit_option(Options) ->
     CommitSettings = {
@@ -1236,8 +1236,8 @@ open_doc_revs_int(Db, IdRevs, Options) ->
                     ?REV_MISSING ->
                         % we have the rev in our list but know nothing about it
                         {{not_found, missing}, {Pos, Rev}};
-                    #leaf{deleted=IsDeleted, ptr=SummaryPtr} ->
-                        {ok, make_doc(Db, Id, IsDeleted, SummaryPtr, FoundRevPath)}
+                    #leaf{deleted=IsDeleted, ptr=SummaryPtr, px_epoch=PxEpoch, px_seq=PxSeq} ->
+                        {ok, make_doc(Db, Id, IsDeleted, SummaryPtr, FoundRevPath, PxEpoch, PxSeq)}
                     end
                 end, FoundRevs),
                 Results = FoundResults ++ [{{not_found, missing}, MissingRev} || MissingRev <- MissingRevs],
@@ -1260,14 +1260,14 @@ open_doc_int(Db, <<?LOCAL_DOC_PREFIX, _/binary>> = Id, Options) ->
     end;
 open_doc_int(Db, #doc_info{id=Id,revs=[RevInfo|_]}=DocInfo, Options) ->
     #rev_info{deleted=IsDeleted,rev={Pos,RevId},body_sp=Bp} = RevInfo,
-    Doc = make_doc(Db, Id, IsDeleted, Bp, {Pos,[RevId]}),
+    Doc = make_doc(Db, Id, IsDeleted, Bp, {Pos,[RevId]}, -1, -1),
     apply_open_options(
        {ok, Doc#doc{meta=doc_meta_info(DocInfo, [], Options)}}, Options);
-open_doc_int(Db, #full_doc_info{id=Id,rev_tree=RevTree}=FullDocInfo, Options) ->
+open_doc_int(Db, #full_doc_info{id=Id,rev_tree=RevTree,px_epoch=PxEpoch,px_seq=PxSeq}=FullDocInfo, Options) ->
     #doc_info{revs=[#rev_info{deleted=IsDeleted,rev=Rev,body_sp=Bp}|_]} =
         DocInfo = couch_doc:to_doc_info(FullDocInfo),
     {[{_, RevPath}], []} = couch_key_tree:get(RevTree, [Rev]),
-    Doc = make_doc(Db, Id, IsDeleted, Bp, RevPath),
+    Doc = make_doc(Db, Id, IsDeleted, Bp, RevPath, PxEpoch, PxSeq),
     apply_open_options(
         {ok, Doc#doc{meta=doc_meta_info(DocInfo, RevTree, Options)}}, Options);
 open_doc_int(Db, Id, Options) ->
@@ -1322,15 +1322,17 @@ read_doc(#db{fd=Fd}, Pos) ->
     couch_file:pread_term(Fd, Pos).
 
 
-make_doc(_Db, Id, Deleted, nil = _Bp, RevisionPath) ->
+make_doc(_Db, Id, Deleted, nil = _Bp, RevisionPath, PxEpoch, PxSeq) ->
     #doc{
         id = Id,
         revs = RevisionPath,
         body = [],
         atts = [],
-        deleted = Deleted
+        deleted = Deleted,
+        px_epoch = PxEpoch,
+        px_seq = PxSeq
     };
-make_doc(#db{fd=Fd}=Db, Id, Deleted, Bp, RevisionPath) ->
+make_doc(#db{fd=Fd}=Db, Id, Deleted, Bp, RevisionPath, PxEpoch, PxSeq) ->
     {BodyData, Atts0} = case Bp of
         nil ->
             {[], []};
@@ -1349,7 +1351,9 @@ make_doc(#db{fd=Fd}=Db, Id, Deleted, Bp, RevisionPath) ->
         revs = RevisionPath,
         body = BodyData,
         atts = Atts,
-        deleted = Deleted
+        deleted = Deleted,
+        px_epoch = PxEpoch,
+        px_seq = PxSeq
     },
     after_doc_read(Db, Doc).
 
