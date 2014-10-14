@@ -860,10 +860,10 @@ update_docs_int(Db, DocsList, NonRepDocs, MergeConflicts, FullCommit) ->
     OldDocInfos = lists:zipwith(
         fun(_Id, {ok, FullDocInfo}) ->
             FullDocInfo;
-        ([{_Client, #doc{id=Id,px_epoch=PxEpoch,px_seq=PxSeq}}|_], not_found) ->
-            #full_doc_info{id=Id,px_epoch=PxEpoch,px_seq=PxSeq} % This works but is it right?
+        (Id, not_found) ->
+            #full_doc_info{id=Id}
         end,
-        DocsList, OldDocLookups),
+        Ids, OldDocLookups),
     % Merge the new docs into the revision trees.
     {ok, NewFullDocInfos, RemoveSeqs, NewSeq} = merge_rev_trees(RevsLimit,
             MergeConflicts, DocsList, OldDocInfos, [], [], LastSeq),
