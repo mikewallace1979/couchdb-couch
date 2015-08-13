@@ -819,6 +819,8 @@ prep_and_validate_replicated_updates(Db, [Bucket|RestBuckets], [OldInfo|RestOldI
 
 
 
+new_revid(#doc{body=Body}=Doc) when is_binary(Body) ->
+    new_revid(couch_doc:with_ejson_body(Doc));
 new_revid(#doc{body=Body, revs={OldStart,OldRevs}, atts=Atts, deleted=Deleted}) ->
     DigestedAtts = lists:foldl(fun(Att, Acc) ->
         [N, T, M] = couch_att:fetch([name, type, md5], Att),
